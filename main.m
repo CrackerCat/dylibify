@@ -94,6 +94,12 @@ void patch_pagezero(FILE *obj_file, off_t offset, struct load_command *cmd, BOOL
     free(dylib_cmd);
 }
 
+void skipuleb(uint8_t* bytes, int* ir) {
+    int i = *ir;
+    while(bytes[i++] & 0x80);
+    *ir = i;
+}
+
 void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo) {
     if (dyldinfo->rebase_off != 0) {
         
@@ -101,19 +107,39 @@ void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo
         //----Some of them are just 1 byte, some are 2 bytes, some are whole strings----//
         //----We only need the ones referencing to segments, which are 1 byte----//
         
-        for (int i = 0; i < dyldinfo->rebase_size; i++) {
-            uint8_t *bytes = load_bytes(file, offset + dyldinfo->rebase_off + i, sizeof(uint8_t));
-            
-            if ((*bytes & REBASE_OPCODE_MASK) == REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB) {
-                printf("\t\t[-] REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB before = 0x%x\n", *bytes);
-                *bytes -= 1; // "-1" -> one less segment = previous segment
-                write_bytes(file, offset + dyldinfo->rebase_off + i, sizeof(uint8_t), bytes);
-                bytes = load_bytes(file, offset + dyldinfo->rebase_off + i, sizeof(uint8_t));
-                printf("\t\t[+] REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB now = 0x%x\n", *bytes);
-                break;
+        uint8_t *bytes = load_bytes(file, offset + dyldinfo->rebase_off, dyldinfo->rebase_size);
+        for (int i = 0; i < dyldinfo->rebase_size; ) {
+            switch(bytes[i] & REBASE_OPCODE_MASK) {
+                case REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
+                    bytes[i] = bytes[i] - 1;
+                    ++i;
+                    skipuleb(bytes, &i);
+                    break;
+                case REBASE_OPCODE_DONE:
+                case REBASE_OPCODE_DO_REBASE_IMM_TIMES:
+                case REBASE_OPCODE_ADD_ADDR_IMM_SCALED:
+                case REBASE_OPCODE_SET_TYPE_IMM:
+                    ++i;
+                    break;
+                case REBASE_OPCODE_ADD_ADDR_ULEB:
+                case REBASE_OPCODE_DO_REBASE_ULEB_TIMES:
+                case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB:
+                    ++i;
+                    skipuleb(bytes, &i);
+                    break;
+                case REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB:
+                    ++i;
+                    skipuleb(bytes, &i);
+                    skipuleb(bytes, &i);
+                    break;
+                default:
+                    printf("UNHANDLED OPCODE! %x\n", bytes[i] & REBASE_OPCODE_MASK);
+                    exit(1);
+                    break;
             }
-            free(bytes);
         }
+        write_bytes(file, offset + dyldinfo->rebase_off, dyldinfo->rebase_size, bytes);
+        free(bytes);
     }
     if(dyldinfo->bind_off != 0) {
         for (int i = 0; i < dyldinfo->bind_size; i++) {
@@ -122,7 +148,7 @@ void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo
             switch (*bytes & BIND_OPCODE_MASK) {
                 case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
                     printf("\t\t[-] BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB before = 0x%x\n", *bytes);
-                    if ((*bytes & 0xF) == 2) *bytes -= 1;
+                    *bytes -= 1;
                     write_bytes(file, offset + dyldinfo->bind_off + i, sizeof(uint8_t), bytes);
                     bytes = load_bytes(file, offset + dyldinfo->bind_off + i, sizeof(uint8_t));
                     printf("\t\t[+] BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB now = 0x%x\n", *bytes);
@@ -138,6 +164,7 @@ void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo
                     }
                     break;
                 case BIND_OPCODE_ADD_ADDR_ULEB:
+                case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
                     while (*bytes != BIND_OPCODE_DO_BIND) {
                         i += 1;
                         bytes = load_bytes(file, offset + dyldinfo->bind_off + i, sizeof(uint8_t));
@@ -156,7 +183,7 @@ void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo
             switch (*bytes & BIND_OPCODE_MASK) {
                 case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
                     printf("\t\t[-] BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB before = 0x%x\n", *bytes);
-                    if ((*bytes & 0xF) == 2) *bytes -= 1;
+                    *bytes -= 1;
                     write_bytes(file, offset + dyldinfo->lazy_bind_off + i, sizeof(uint8_t), bytes);
                     bytes = load_bytes(file, offset + dyldinfo->lazy_bind_off + i, sizeof(uint8_t));
                     printf("\t\t[+] BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB now = 0x%x\n", *bytes);
@@ -171,6 +198,7 @@ void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo
                         bytes = load_bytes(file, offset + dyldinfo->lazy_bind_off + i, sizeof(uint8_t));
                     }
                     break;
+                case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
                 case BIND_OPCODE_ADD_ADDR_ULEB:
                     while (*bytes != BIND_OPCODE_DO_BIND) {
                         i += 1;
@@ -190,7 +218,7 @@ void patch_dyldinfo(FILE *file, off_t offset, struct dyld_info_command *dyldinfo
             switch (*bytes & BIND_OPCODE_MASK) {
                 case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
                     printf("\t\t[-] BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB before = 0x%x\n", *bytes);
-                    if ((*bytes & 0xF) == 2) *bytes -= 1;
+                    *bytes -= 1;
                     write_bytes(file, offset + dyldinfo->weak_bind_off + i, sizeof(uint8_t), bytes);
                     bytes = load_bytes(file, offset + dyldinfo->weak_bind_off + i, sizeof(uint8_t));
                     printf("\t\t[+] BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB now = 0x%x\n", *bytes);
@@ -274,6 +302,11 @@ int dylibify(const char *macho, const char *saveto) {
                 struct segment_command_64 *seg64 = load_bytes(file, offset, sizeof(struct segment_command_64));
                 
                 printf("\t[i] LC_SEGMENT_64 (%s)\n", seg64->segname);
+                /*if(seg64->maxprot & VM_PROT_EXECUTE) {
+                    seg64->maxprot |= VM_PROT_WRITE;
+                    seg64->initprot |= VM_PROT_WRITE;
+                    write_bytes(file, offset, sizeof(struct segment_command_64), (uint8_t*) seg64);
+                }*/
                 
                 //----Dylibs don't have the PAGEZERO segment, replace it with a LC_ID_DYLIB command----//
                 if (!strcmp(seg64->segname, "__PAGEZERO")) {
